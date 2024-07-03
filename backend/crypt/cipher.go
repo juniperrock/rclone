@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	gocipher "crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/base64"
 	"errors"
@@ -643,6 +644,12 @@ func (n *nonce) fromBuf(buf []byte) {
 	}
 }
 
+// fromString derives a nonce from a string using SHA-256
+func (n *nonce) fromString(s string) {
+	hash := sha256.Sum256([]byte(s))
+	copy(n[:], hash[:fileNonceSize])
+}
+
 // carry 1 up the nonce from position i
 func (n *nonce) carry(i int) {
 	for ; i < len(*n); i++ {
@@ -683,11 +690,15 @@ type encrypter struct {
 	in       io.Reader
 	c        *Cipher
 	nonce    nonce
+	initialNonce nonce
 	buf      *[blockSize]byte
 	readBuf  *[blockSize]byte
 	bufIndex int
 	bufSize  int
+	headerWritten bool
 	err      error
+	limit    int64 // limit of bytes to read, -1 for unlimited
+	open     OpenRangeSeek
 }
 
 // newEncrypter creates a new file handle encrypting on the fly
@@ -697,7 +708,7 @@ func (c *Cipher) newEncrypter(in io.Reader, nonce *nonce) (*encrypter, error) {
 		c:       c,
 		buf:     c.getBlock(),
 		readBuf: c.getBlock(),
-		bufSize: fileHeaderSize,
+		limit:   -1,
 	}
 	// Initialise nonce
 	if nonce != nil {
@@ -708,11 +719,77 @@ func (c *Cipher) newEncrypter(in io.Reader, nonce *nonce) (*encrypter, error) {
 			return nil, err
 		}
 	}
-	// Copy magic into buffer
-	copy((*fh.buf)[:], fileMagicBytes)
-	// Copy nonce into buffer
-	copy((*fh.buf)[fileMagicSize:], fh.nonce[:])
+	fh.initialNonce = fh.nonce
 	return fh, nil
+}
+
+// newEncrypterSeek creates a new file handle encrypting on the fly
+func (c *Cipher) newEncrypterSeek(ctx context.Context, open OpenRangeSeek, offset, limit int64, nonce *nonce) (io.Reader, *encrypter, error) {
+	var in io.Reader
+	var fh *encrypter
+	var err error
+
+	// Calculate the underlying offset and limit
+	underlyingOffset, underlyingLimit, _, _ := calculateUnderlyingReverse(offset, limit)
+
+	// Open the underlying reader with the calculated offset and limit
+	in, err = open(ctx, underlyingOffset, underlyingLimit)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create the encrypter
+	in, wrap := accounting.UnWrap(in) // unwrap the accounting off the Reader
+	fh, err = c.newEncrypter(in, nonce)
+	if err != nil {
+		return nil, nil, err
+	}
+	fh.open = open // will be called by fh.RangeSeek
+
+	// If offset is not zero, seek to the correct position
+	if offset > 0 {
+		_, err = fh.RangeSeek(ctx, offset, io.SeekStart, limit)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// Set the limit
+	if offset == 0 && limit >= 0 {
+		fh.limit = limit
+	}
+
+	return wrap(fh), fh, nil // and wrap the accounting back on
+}
+
+// read data into internal buffer - call with fh.mu held
+func (fh *encrypter) fillBuffer(writeHeader bool) (err error) {
+	if writeHeader && !fh.headerWritten {
+		// Write the file header to the output buffer
+		copy((*fh.buf)[:], fileMagicBytes)
+		copy((*fh.buf)[fileMagicSize:], fh.initialNonce[:])
+		fh.bufIndex = 0
+		fh.bufSize = fileHeaderSize
+		fh.headerWritten = true
+
+		return nil
+	}
+
+	// FIXME should overlap the reads with a go-routine and 2 buffers?
+	readBuf := (*fh.readBuf)[:blockDataSize]
+	n, err := readers.ReadFill(fh.in, readBuf)
+	if n == 0 {
+		return fh.finish(err)
+	}
+	// possibly err != nil here, but we will process the
+	// data and the next call to ReadFill will return 0, err
+	// Encrypt the block using the nonce
+	secretbox.Seal((*fh.buf)[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
+	fh.bufIndex = 0
+	fh.bufSize = blockHeaderSize + n
+	fh.nonce.increment()
+
+	return nil
 }
 
 // Read as per io.Reader
@@ -724,37 +801,211 @@ func (fh *encrypter) Read(p []byte) (n int, err error) {
 		return 0, fh.err
 	}
 	if fh.bufIndex >= fh.bufSize {
-		// Read data
-		// FIXME should overlap the reads with a go-routine and 2 buffers?
-		readBuf := (*fh.readBuf)[:blockDataSize]
-		n, err = readers.ReadFill(fh.in, readBuf)
-		if n == 0 {
-			return fh.finish(err)
+		err = fh.fillBuffer(true)
+		if err != nil {
+			return 0, fh.finish(err)
 		}
-		// possibly err != nil here, but we will process the
-		// data and the next call to ReadFill will return 0, err
-		// Encrypt the block using the nonce
-		secretbox.Seal((*fh.buf)[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
-		fh.bufIndex = 0
-		fh.bufSize = blockHeaderSize + n
-		fh.nonce.increment()
 	}
-	n = copy(p, (*fh.buf)[fh.bufIndex:fh.bufSize])
+	toCopy := fh.bufSize - fh.bufIndex
+	if fh.limit >= 0 && fh.limit < int64(toCopy) {
+		toCopy = int(fh.limit)
+	}
+	n = copy(p, (*fh.buf)[fh.bufIndex:fh.bufIndex+toCopy])
 	fh.bufIndex += n
+	if fh.limit >= 0 {
+		fh.limit -= int64(n)
+		if fh.limit == 0 {
+			return n, fh.finish(io.EOF)
+		}
+	}
 	return n, nil
 }
 
-// finish sets the final error and tidies up
-func (fh *encrypter) finish(err error) (int, error) {
-	if fh.err != nil {
+// RangeSeek behaves like a call to Seek(offset int64, whence
+// int) with the output wrapped in an io.LimitedReader
+// limiting the total length to limit.
+//
+// RangeSeek with a limit of < 0 is equivalent to a regular Seek.
+func (fh *encrypter) RangeSeek(ctx context.Context, offset int64, whence int, limit int64) (int64, error) {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+
+	if fh.open == nil {
+		return 0, fh.finish(errors.New("can't seek - not initialised with newEncrypterSeek"))
+	}
+	if whence != io.SeekStart {
+		return 0, fh.finish(errors.New("can only seek from the start"))
+	}
+
+	// Reset error or return it if not EOF
+	if fh.err == io.EOF {
+		fh.unFinish()
+	} else if fh.err != nil {
 		return 0, fh.err
+	}
+
+	underlyingOffset, underlyingLimit, blockStart, discardStart := calculateUnderlyingReverse(offset, limit)
+
+	// Move the nonce on the correct number of blocks from the start
+	fh.nonce = fh.initialNonce
+	fh.nonce.add(uint64(blockStart))
+
+	// Can we seek underlying stream directly?
+	if do, ok := fh.in.(fs.RangeSeeker); ok {
+		// Seek underlying stream directly
+		_, err := do.RangeSeek(ctx, underlyingOffset, 0, underlyingLimit)
+		if err != nil {
+			return 0, fh.finish(err)
+		}
+	} else {
+		// if not reopen with seek
+		if closer, ok := fh.in.(io.Closer); ok {
+			_ = closer.Close() // close underlying file
+		}
+		fh.in = nil
+
+		// Re-open the underlying object with the offset given
+		in, err := fh.open(ctx, underlyingOffset, underlyingLimit)
+		if err != nil {
+			return 0, fh.finish(fmt.Errorf("couldn't reopen file with offset and limit: %w", err))
+		}
+
+		// Set the file handle
+		fh.in = in
+	}
+
+	// If the offset is within the file header, write the file header to the buffer. Otherwise fill the buffer
+	err := fh.fillBuffer(offset < int64(fileHeaderSize))
+	if err != nil {
+		return 0, fh.finish(err)
+	}
+
+	// Discard bytes from the buffer
+	if int(discardStart) > fh.bufSize {
+		return 0, fh.finish(ErrorBadSeek)
+	}
+	fh.bufIndex = int(discardStart)
+
+	// Set the limit
+	fh.limit = limit
+
+	return offset, nil
+}
+
+// Seek implements the io.Seeker interface
+func (fh *encrypter) Seek(offset int64, whence int) (int64, error) {
+	return fh.RangeSeek(context.TODO(), offset, whence, -1)
+}
+
+// finish sets the final error and tidies up
+func (fh *encrypter) finish(err error) error {
+	if fh.err != nil {
+		return fh.err
 	}
 	fh.err = err
 	fh.c.putBlock(fh.buf)
 	fh.buf = nil
 	fh.c.putBlock(fh.readBuf)
 	fh.readBuf = nil
-	return 0, err
+	return err
+}
+
+// unFinish undoes the effects of finish
+func (fh *encrypter) unFinish() {
+	// Clear error
+	fh.err = nil
+
+	// reinstate the buffers
+	fh.buf = fh.c.getBlock()
+	fh.readBuf = fh.c.getBlock()
+
+	// Empty the buffer
+	fh.bufIndex = 0
+	fh.bufSize = 0
+}
+
+// Close
+func (fh *encrypter) Close() error {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+
+	// Check already closed
+	if fh.err == ErrorFileClosed {
+		return fh.err
+	}
+	// Closed before reading EOF so not finish()ed yet
+	if fh.err == nil {
+		_ = fh.finish(io.EOF)
+	}
+	// Show file now closed
+	fh.err = ErrorFileClosed
+	if fh.in == nil {
+		return nil
+	}
+	if closer, ok := fh.in.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil;
+}
+
+// finishAndClose does finish then Close()
+//
+// Used when we are returning a nil fh from new
+func (fh *encrypter) finishAndClose(err error) error {
+	_ = fh.finish(err)
+	_ = fh.Close()
+	return err
+}
+
+// calculateUnderlyingReverse converts an (offset, limit) in the encrypted stream
+// into an (underlyingOffset, underlyingLimit) for the underlying plaintext file.
+func calculateUnderlyingReverse(offset, limit int64) (underlyingOffset, underlyingLimit, blockStart, discardStart int64) {
+	// Subtract file header from offset
+	offsetWithoutFileHeader := offset - int64(fileHeaderSize)
+
+	if offsetWithoutFileHeader >= 0 {
+		// blocks we need to seek, plus bytes we need to discard
+		blockStart, discardStart = offsetWithoutFileHeader / blockSize, offsetWithoutFileHeader % blockSize
+
+		// Offset in underlying stream we need to seek
+		underlyingOffset = blockStart * blockDataSize
+	}
+
+	// work out how many blocks we need to read
+	underlyingLimit = int64(-1)
+	if limit >= 0 {
+		// If offset is within the file header, subtract the remaining file header from limit
+		if limit > 0 && offsetWithoutFileHeader < 0 {
+			underlyingLimit = limit + offsetWithoutFileHeader
+
+			if underlyingLimit < 0 {
+				underlyingLimit = 0
+			}
+		}
+
+		if underlyingLimit > 0 {
+			// bytes to read beyond the first block
+			bytesToRead := underlyingLimit - (blockSize - discardStart)
+
+			// Read the first block
+			blocksToRead := int64(1)
+
+			if bytesToRead > 0 {
+				// Blocks that need to be read plus left over bytes
+				extraBlocksToRead, discardEnd := bytesToRead / blockSize, bytesToRead % blockSize
+				if discardEnd > 0 {
+					// If left over bytes must read another block
+					extraBlocksToRead++
+				}
+				blocksToRead += extraBlocksToRead
+			}
+
+			// Must read a whole number of blocks
+			underlyingLimit = blocksToRead * blockDataSize
+		}
+	}
+
+	return
 }
 
 // Encrypt data encrypts the data stream
@@ -765,6 +1016,22 @@ func (c *Cipher) encryptData(in io.Reader) (io.Reader, *encrypter, error) {
 		return nil, nil, err
 	}
 	return wrap(out), out, nil // and wrap the accounting back on
+}
+
+// EncryptDataSeek encrypts the data stream from offset
+//
+// The open function must return a ReadCloser opened to the offset supplied.
+//
+// You must use this form of EncryptData if you might want to Seek the file handle
+func (c *Cipher) EncryptDataSeek(ctx context.Context, open OpenRangeSeek, offset, limit int64, nonce *nonce) (ReadSeekCloser, error) {
+	fh, _, err := c.newEncrypterSeek(ctx, open, offset, limit, nonce)
+	if err != nil {
+		return nil, err
+	}
+	if rsc, ok := fh.(ReadSeekCloser); ok {
+		return rsc, nil
+	}
+	panic("encrypter is not ReadSeekCloser")
 }
 
 // EncryptData encrypts the data stream
